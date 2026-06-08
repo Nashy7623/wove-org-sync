@@ -1,0 +1,29 @@
+# Build outputs
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+fabric_test
+
+# Logs
+*.log
+
+# Third-party headers (download separately)
+json.hpp
+
+# MSVC local settings
+.vs/
+*.user
+*.suo
+*.vcxproj.user
+
+# CMake
+build/
+CMakeCache.txt
+CMakeFiles/
+
+# Credentials / local config
+*.env
+config.local.*
