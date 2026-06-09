@@ -27,3 +27,8 @@ CMakeFiles/
 # Credentials / local config
 *.env
 config.local.*
+
+# Local reference docs (saved Swagger page)
+Wove External API Documentation.html
+Wove External API Documentation_files/
+doc-template.html
