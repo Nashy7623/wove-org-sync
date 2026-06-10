@@ -1,26 +1,56 @@
 // wove_org_sync.cpp
-// Syncs TMS Organizations from a Microsoft Fabric Lakehouse to the Wove API.
-// Reads source data via ODBC, fetches current Wove orgs, diffs them, then
-// POSTs new records and PUTs changed records.
+// Syncs AU-region TMS Organizations from the CW1 reporting SQL Server (direct
+// ODBC query) to the Wove External API. Fetches all current Wove orgs
+// (page/limit pagination), fetches active CW1 orgs (main address resolved by
+// dbo.MainAddressPkForOrg), diffs in memory keyed on org code, POSTs new orgs
+// and PUTs changed ones. Orphans (in Wove, not in CW1) are logged, never
+// deleted.
 //
-// Dependencies:
-//   nlohmann/json single header — download json.hpp from:
-//   https://github.com/nlohmann/json/releases  (place next to this file)
+// PRD: https://github.com/Nashy7623/wove-org-sync/issues/1
+//
+// Usage:
+//   wove_org_sync.exe [--dry-run]
+//
+//   --dry-run   Full pipeline (auth, both fetches, diff) but no writes;
+//               logs every intended create/update with the changed fields.
+//
+// Environment (all required):
+//   WOVE_CLIENT_ID, WOVE_CLIENT_SECRET
+//   CW1_SERVER, CW1_DATABASE, CW1_DB_USER, CW1_DB_PASSWORD
+// Optional:
+//   WOVE_MAX_WRITES_PER_RUN  write budget per run (default 8000 — keeps a
+//                            full run under the API's 10,000 req/day cap
+//                            after the ~1,550-page GET sweep)
+//
+// Wove API constraints (verified live 2026-06-10):
+//   - Pagination is ?page=N&limit=100. `skip` is SILENTLY IGNORED, so every
+//     response's pagination.page is asserted to echo the request.
+//   - `limit` is server-clamped to 100.
+//   - Rate limits: 60 req/min, 10,000 req/day. Rate-limit errors can arrive
+//     as HTTP 200 with {"success":false,"error":{"code":"RATE_LIMIT_ERROR"}}
+//     so response bodies are checked, not just status codes.
+//   - Page ordering is unstable; a sweep may miss/duplicate a handful of
+//     records, so reconciliation counts allow a small tolerance.
 //
 // Build (MSVC Developer Command Prompt):
-//   cl wove_org_sync.cpp /EHsc /link winhttp.lib odbc32.lib odbccp32.lib
+//   cl wove_org_sync.cpp /EHsc /std:c++17 /link winhttp.lib odbc32.lib odbccp32.lib
 
 #include <windows.h>
 #include <winhttp.h>
 #include <sql.h>
 #include <sqlext.h>
-#include <string>
-#include <sstream>
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
 #include <fstream>
 #include <iostream>
-#include <vector>
 #include <map>
-#include <ctime>
+#include <set>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
 #include "json.hpp"
 
 #pragma comment(lib, "winhttp.lib")
@@ -32,41 +62,68 @@ using json = nlohmann::json;
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
+static const wchar_t* WOVE_HOST  = L"api.wove.com";
+static const wchar_t* TOKEN_PATH = L"/api/v1/external/auth/token";
+static const wchar_t* ORG_PATH   = L"/api/v1/external/tms/organizations";
+static const char*    ORG_SOURCE = "cw";
+static const char*    SOURCE_REGION = "AU";
+static const char*    LOG_FILE   = "wove_org_sync.log";
 
-// Wove API
-static const wchar_t* WOVE_HOST        = L"api.wove.com";
-static const wchar_t* TOKEN_PATH       = L"/api/v1/external/auth/token";
-static const wchar_t* ORG_PATH         = L"/api/v1/external/tms/organizations";
-static const char*    CLIENT_ID        = "YOUR_CLIENT_ID";
-static const char*    CLIENT_SECRET    = "YOUR_CLIENT_SECRET";
-static const char*    ORG_SOURCE       = "cw";
+static const int  PAGE_SIZE            = 100;     // server-clamped maximum
+static const int  HTTP_MAX_ATTEMPTS    = 6;       // per request, incl. first try
+static const int  HTTP_BACKOFF_BASE_MS = 2000;    // 2s, 4s, 8s, 16s, 32s
+static const int  PACE_INTERVAL_MS     = 1100;    // < 60 requests/minute
+static const int  DEFAULT_MAX_WRITES   = 8000;    // per-run write budget
+static const long CW1_MIN_EXPECTED_ROWS = 100000; // contract: sanity floor
+static const int  RECONCILE_TOLERANCE  = 100;     // unstable-ordering allowance
 
-// Fabric ODBC — use DSN or full connection string
-// Example DSN-less string for Fabric SQL Analytics Endpoint:
-//   "Driver={ODBC Driver 18 for SQL Server};"
-//   "Server=<workspace-guid>.datawarehouse.fabric.microsoft.com,1433;"
-//   "Database=<lakehouse-name>;"
-//   "Authentication=ActiveDirectoryServicePrincipal;"
-//   "UID=<app-client-id>;"
-//   "PWD=<app-client-secret>;"
-//   "Encrypt=yes;"
-static const char* ODBC_CONN_STRING =
-    "Driver={ODBC Driver 18 for SQL Server};"
-    "Server=YOUR_WORKSPACE.datawarehouse.fabric.microsoft.com,1433;"
-    "Database=YOUR_LAKEHOUSE;"
-    "Authentication=ActiveDirectoryServicePrincipal;"
-    "UID=YOUR_APP_CLIENT_ID;"
-    "PWD=YOUR_APP_CLIENT_SECRET;"
-    "Encrypt=yes;";
+// CW1 OH_Is* role flag -> Wove `types` value.
+// Wove's vocabulary is lowercase; values observed in live Wove data:
+// carrier, shipper, consignee, warehouse, ocean_carrier. Mappings marked
+// (unconfirmed) have no observed counterpart yet — validate via dry-run /
+// Wove before first live run and adjust here only.
+static const std::vector<std::pair<const char*, const char*>> TYPE_MAP = {
+    { "Consignor",       "shipper"          },
+    { "Consignee",       "consignee"        },
+    { "Forwarder",       "forwarder"        },  // (unconfirmed)
+    { "Carrier",         "carrier"          },
+    { "Broker",          "broker"           },  // (unconfirmed)
+    { "WarehouseClient", "warehouse"        },
+    { "TransportClient", "transport_client" },  // (unconfirmed)
+};
 
-// Adjust this query and column names to match your actual Fabric table
-static const char* FABRIC_QUERY =
-    "SELECT code, name, types, carrier_code, "
-    "       address1, address2, city, state, postal_code, country, "
-    "       phone_number, mobile_number, fax_number, email, website, is_active "
-    "FROM   dbo.tms_organizations";
-
-static const char* LOG_FILE = "wove_org_sync.log";
+// Source query. One row per active org; the comma-delimited cw1_types tokens
+// are the left-hand side of TYPE_MAP. Main address resolved exactly as the
+// legacy ingest view did (OUTER APPLY dbo.MainAddressPkForOrg).
+static const char* CW1_QUERY =
+    "SET NOCOUNT ON;"
+    "SELECT"
+    "    CONVERT(varchar(36), oh.OH_PK)        AS org_pk,"
+    "    oh.OH_Code                            AS code,"
+    "    ISNULL(oh.OH_FullName,'')             AS name,"
+    "    SUBSTRING("
+    "          CASE WHEN oh.OH_IsConsignor        = 1 THEN ',Consignor'       ELSE '' END"
+    "        + CASE WHEN oh.OH_IsConsignee        = 1 THEN ',Consignee'       ELSE '' END"
+    "        + CASE WHEN oh.OH_IsForwarder        = 1 THEN ',Forwarder'       ELSE '' END"
+    "        + CASE WHEN oh.OH_IsShippingProvider = 1 THEN ',Carrier'         ELSE '' END"
+    "        + CASE WHEN oh.OH_IsBroker           = 1 THEN ',Broker'          ELSE '' END"
+    "        + CASE WHEN oh.OH_IsWarehouseClient  = 1 THEN ',WarehouseClient' ELSE '' END"
+    "        + CASE WHEN oh.OH_IsTransportClient  = 1 THEN ',TransportClient' ELSE '' END"
+    "    , 2, 4000)                            AS cw1_types,"
+    "    ISNULL(oa.OA_Address1,'')             AS address1,"
+    "    ISNULL(oa.OA_Address2,'')             AS address2,"
+    "    ISNULL(oa.OA_City,'')                 AS city,"
+    "    ISNULL(oa.OA_State,'')                AS state,"
+    "    ISNULL(oa.OA_PostCode,'')             AS postal_code,"
+    "    ISNULL(oa.OA_RN_NKCountryCode,'')     AS country,"
+    "    ISNULL(oa.OA_Phone,'')                AS phone,"
+    "    ISNULL(oa.OA_Mobile,'')               AS mobile,"
+    "    ISNULL(oa.OA_Fax,'')                  AS fax,"
+    "    ISNULL(oa.OA_Email,'')                AS email "
+    "FROM dbo.OrgHeader oh "
+    "OUTER APPLY dbo.MainAddressPkForOrg(oh.OH_PK) m "
+    "LEFT JOIN dbo.OrgAddress oa ON oa.OA_PK = m.PK "
+    "WHERE oh.OH_IsActive = 1";
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -83,441 +140,680 @@ static void log(const std::string& msg)
 }
 
 // ---------------------------------------------------------------------------
-// Org record — mirrors Wove's TmsOrganization fields
+// Small helpers
 // ---------------------------------------------------------------------------
-struct OrgRecord {
-    std::string woweId;      // populated from Wove GET; empty for new records
-    std::string code;
-    std::string name;
-    std::string types;       // comma-delimited in Fabric, converted to JSON array on POST/PUT
-    std::string carrierCode;
-    std::string address1;
-    std::string address2;
-    std::string city;
-    std::string state;
-    std::string postalCode;
-    std::string country;
-    std::string phoneNumber;
-    std::string mobileNumber;
-    std::string faxNumber;
-    std::string email;
-    std::string website;
-    bool        isActive = true;
-};
-
-static bool orgsEqual(const OrgRecord& a, const OrgRecord& b)
+static std::string getEnvOrEmpty(const char* name)
 {
-    return a.name        == b.name
-        && a.types       == b.types
-        && a.carrierCode == b.carrierCode
-        && a.address1    == b.address1
-        && a.address2    == b.address2
-        && a.city        == b.city
-        && a.state       == b.state
-        && a.postalCode  == b.postalCode
-        && a.country     == b.country
-        && a.phoneNumber == b.phoneNumber
-        && a.mobileNumber== b.mobileNumber
-        && a.faxNumber   == b.faxNumber
-        && a.email       == b.email
-        && a.website     == b.website
-        && a.isActive    == b.isActive;
+    char buf[1024];
+    DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
+    return (n > 0 && n < sizeof(buf)) ? std::string(buf, n) : std::string();
 }
 
-// ---------------------------------------------------------------------------
-// JSON helpers
-// ---------------------------------------------------------------------------
-
-// Escapes a string value for embedding in a JSON string literal
-static std::string jsonEscape(const std::string& s)
+static std::wstring toWide(const std::string& s)
 {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s) {
-        switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:   out += c;
-        }
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+// Control chars (embedded tabs/newlines exist in e.g. OA_PostCode) -> space,
+// then trim. Applied to every CW1 text column so payloads and comparisons
+// never see transport junk.
+static std::string sanitize(const std::string& s)
+{
+    std::string out = s;
+    for (char& c : out)
+        if ((unsigned char)c < 0x20) c = ' ';
+    size_t b = out.find_first_not_of(' ');
+    if (b == std::string::npos) return "";
+    size_t e = out.find_last_not_of(' ');
+    return out.substr(b, e - b + 1);
+}
+
+static std::vector<std::string> splitCsv(const std::string& csv)
+{
+    std::vector<std::string> out;
+    std::istringstream ss(csv);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        tok = sanitize(tok);
+        if (!tok.empty()) out.push_back(tok);
     }
     return out;
 }
 
-// Converts "shipper,consignee" → ["shipper","consignee"]
-static std::string typesToJsonArray(const std::string& csv)
+// Sorted, deduped — comparison and payload are both order-insensitive.
+static std::vector<std::string> normalizeTypes(std::vector<std::string> v)
 {
-    if (csv.empty()) return "[]";
-    std::ostringstream arr;
-    arr << "[";
-    std::istringstream ss(csv);
-    std::string token;
-    bool first = true;
-    while (std::getline(ss, token, ',')) {
-        if (!token.empty()) {
-            if (!first) arr << ",";
-            arr << "\"" << jsonEscape(token) << "\"";
-            first = false;
-        }
-    }
-    arr << "]";
-    return arr.str();
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+    return v;
 }
 
-static std::string buildPayload(const OrgRecord& org)
+static std::set<std::string> g_unknownCw1Types;
+
+static std::vector<std::string> mapCw1Types(const std::string& csv)
 {
-    std::ostringstream j;
-    j << "{"
-      << "\"source\":\"" << ORG_SOURCE << "\","
-      << "\"code\":\""   << jsonEscape(org.code)   << "\","
-      << "\"name\":\""   << jsonEscape(org.name)   << "\","
-      << "\"isActive\":"  << (org.isActive ? "true" : "false") << ","
-      << "\"types\":"     << typesToJsonArray(org.types);
-
-    auto addStr = [&](const char* key, const std::string& val) {
-        if (!val.empty())
-            j << ",\"" << key << "\":\"" << jsonEscape(val) << "\"";
-    };
-    addStr("carrierCode",  org.carrierCode);
-    addStr("address1",     org.address1);
-    addStr("address2",     org.address2);
-    addStr("city",         org.city);
-    addStr("state",        org.state);
-    addStr("postalCode",   org.postalCode);
-    addStr("country",      org.country);
-    addStr("phoneNumber",  org.phoneNumber);
-    addStr("mobileNumber", org.mobileNumber);
-    addStr("faxNumber",    org.faxNumber);
-    addStr("email",        org.email);
-    addStr("website",      org.website);
-
-    j << "}";
-    return j.str();
+    std::vector<std::string> out;
+    for (const auto& tok : splitCsv(csv)) {
+        bool found = false;
+        for (const auto& [cw1, wove] : TYPE_MAP)
+            if (tok == cw1) { out.push_back(wove); found = true; break; }
+        if (!found) g_unknownCw1Types.insert(tok);
+    }
+    return normalizeTypes(out);
 }
 
 // ---------------------------------------------------------------------------
-// WinHTTP
+// Org record
+// ---------------------------------------------------------------------------
+struct OrgRecord {
+    std::string woveId;   // populated from Wove GET; empty for new records
+    std::string orgPk;    // CW1 OH_PK (source side only)
+    std::string code;
+    std::string name;
+    std::vector<std::string> types;   // normalized Wove vocabulary
+    std::string address1, address2, city, state, postalCode, country;
+    std::string phone, mobile, fax, email;
+    bool isActive = true;
+};
+
+// Fields compared for PUT decisions. carrierCode/website are not sourced from
+// CW1, so they are neither sent nor compared.
+static std::vector<std::string> changedFields(const OrgRecord& src, const OrgRecord& dst)
+{
+    std::vector<std::string> d;
+    auto cmp = [&](const char* f, const std::string& a, const std::string& b) {
+        if (a != b) d.push_back(f);
+    };
+    cmp("name",        src.name,       dst.name);
+    if (src.types != dst.types) d.push_back("types");
+    cmp("address1",    src.address1,   dst.address1);
+    cmp("address2",    src.address2,   dst.address2);
+    cmp("city",        src.city,       dst.city);
+    cmp("state",       src.state,      dst.state);
+    cmp("postal_code", src.postalCode, dst.postalCode);
+    cmp("country",     src.country,    dst.country);
+    cmp("phone",       src.phone,      dst.phone);
+    cmp("mobile",      src.mobile,     dst.mobile);
+    cmp("fax",         src.fax,        dst.fax);
+    cmp("email",       src.email,      dst.email);
+    if (src.isActive != dst.isActive) d.push_back("is_active");
+    return d;
+}
+
+static json buildPayload(const OrgRecord& org)
+{
+    json j;
+    j["source"]   = ORG_SOURCE;
+    j["code"]     = org.code;
+    j["name"]     = org.name;
+    j["isActive"] = org.isActive;
+    j["types"]    = org.types;
+    j["metadata"] = { { "cw1OrgPk", org.orgPk }, { "sourceRegion", SOURCE_REGION } };
+
+    auto add = [&](const char* key, const std::string& val) {
+        if (!val.empty()) j[key] = val;
+    };
+    add("address1",     org.address1);
+    add("address2",     org.address2);
+    add("city",         org.city);
+    add("state",        org.state);
+    add("postalCode",   org.postalCode);
+    add("country",      org.country);
+    add("phoneNumber",  org.phone);
+    add("mobileNumber", org.mobile);
+    add("faxNumber",    org.fax);
+    add("email",        org.email);
+    return j;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP layer: WinHTTP + timeouts + pacing + retries + token refresh
 // ---------------------------------------------------------------------------
 struct Response { DWORD statusCode = 0; std::string body; };
 
-static bool sendRequest(
-    const wchar_t* host,
-    const wchar_t* path,
-    const wchar_t* method,
-    const std::string& body,
-    const wchar_t* contentType,
-    const std::wstring& authHeader,
-    Response& out)
+// <60 req/min across ALL requests (GETs and writes share the rate budget).
+static void pace()
 {
-    HINTERNET hSession = WinHttpOpen(L"NaviaWoveSync/1.0",
+    using clock = std::chrono::steady_clock;
+    static clock::time_point last{};
+    auto now = clock::now();
+    if (last != clock::time_point{}) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count();
+        if (elapsed < PACE_INTERVAL_MS)
+            std::this_thread::sleep_for(std::chrono::milliseconds(PACE_INTERVAL_MS - elapsed));
+    }
+    last = clock::now();
+}
+
+// Single transport attempt. Returns false on any network-level failure.
+static bool sendOnce(const wchar_t* method, const std::wstring& path,
+                     const std::string& body, const std::string& bearer,
+                     Response& out)
+{
+    bool ok = false;
+    HINTERNET hSession = WinHttpOpen(L"NaviaWoveSync/2.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) { log("WinHttpOpen failed"); return false; }
+    if (!hSession) return false;
 
-    HINTERNET hConnect = WinHttpConnect(hSession, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); log("WinHttpConnect failed"); return false; }
+    // resolve / connect / send / receive timeouts — a hung connection cannot
+    // stall the scheduled task indefinitely
+    WinHttpSetTimeouts(hSession, 30000, 30000, 30000, 120000);
 
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, method, path,
-        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    if (!hRequest) {
-        WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
-        log("WinHttpOpenRequest failed"); return false;
+    HINTERNET hConnect = WinHttpConnect(hSession, WOVE_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET hRequest = hConnect ? WinHttpOpenRequest(hConnect, method, path.c_str(),
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
+
+    if (hRequest) {
+        WinHttpAddRequestHeaders(hRequest, L"Content-Type: application/json",
+            (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+        if (!bearer.empty()) {
+            std::wstring auth = L"Authorization: Bearer " + toWide(bearer);
+            WinHttpAddRequestHeaders(hRequest, auth.c_str(), (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+        }
+
+        BOOL sent = WinHttpSendRequest(hRequest,
+            WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.c_str(),
+            (DWORD)body.size(), (DWORD)body.size(), 0);
+
+        if (sent && WinHttpReceiveResponse(hRequest, nullptr)) {
+            DWORD status = 0, size = sizeof(status);
+            WinHttpQueryHeaders(hRequest,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX);
+            out.statusCode = status;
+
+            DWORD avail = 0;
+            while (WinHttpQueryDataAvailable(hRequest, &avail) && avail > 0) {
+                std::string chunk(avail, '\0');
+                DWORD got = 0;
+                WinHttpReadData(hRequest, &chunk[0], avail, &got);
+                out.body.append(chunk.data(), got);
+            }
+            ok = true;
+        }
     }
+    if (hRequest) WinHttpCloseHandle(hRequest);
+    if (hConnect) WinHttpCloseHandle(hConnect);
+    if (hSession) WinHttpCloseHandle(hSession);
+    return ok;
+}
 
-    if (contentType && wcslen(contentType) > 0) {
-        std::wstring ct = std::wstring(L"Content-Type: ") + contentType;
-        WinHttpAddRequestHeaders(hRequest, ct.c_str(), (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+static std::string g_clientId, g_clientSecret, g_token;
+static long g_requestCount = 0;   // visibility against the 10k/day cap
+
+static bool authenticate()
+{
+    json body = {
+        { "grant_type",    "client_credentials" },
+        { "client_id",     g_clientId },
+        { "client_secret", g_clientSecret },
+    };
+    pace();
+    g_requestCount++;
+    Response resp;
+    if (!sendOnce(L"POST", TOKEN_PATH, body.dump(), "", resp)) {
+        log("AUTH: network failure"); return false;
     }
-    if (!authHeader.empty()) {
-        std::wstring auth = L"Authorization: " + authHeader;
-        WinHttpAddRequestHeaders(hRequest, auth.c_str(), (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+    if (resp.statusCode != 200) {
+        log("AUTH: HTTP " + std::to_string(resp.statusCode) + ": " + resp.body);
+        return false;
     }
-
-    BOOL sent = WinHttpSendRequest(hRequest,
-        WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-        body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.c_str(),
-        (DWORD)body.size(), (DWORD)body.size(), 0);
-
-    if (!sent || !WinHttpReceiveResponse(hRequest, nullptr)) {
-        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
-        log("Send/receive failed"); return false;
+    json j = json::parse(resp.body, nullptr, false);
+    if (j.is_discarded() || !j.contains("access_token")) {
+        log("AUTH: could not parse access_token"); return false;
     }
-
-    DWORD statusCode = 0, statusSize = sizeof(statusCode);
-    WinHttpQueryHeaders(hRequest,
-        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
-    out.statusCode = statusCode;
-
-    DWORD bytesAvail = 0;
-    while (WinHttpQueryDataAvailable(hRequest, &bytesAvail) && bytesAvail > 0) {
-        std::string chunk(bytesAvail, '\0');
-        DWORD bytesRead = 0;
-        WinHttpReadData(hRequest, &chunk[0], bytesAvail, &bytesRead);
-        out.body.append(chunk.data(), bytesRead);
-    }
-
-    WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+    g_token = j["access_token"].get<std::string>();
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Wove auth
-// ---------------------------------------------------------------------------
-static std::string getAccessToken()
+// Full request with retries. Handles:
+//   - network failures, 429, 5xx        -> bounded exponential backoff
+//   - 401                                -> re-authenticate once per attempt
+//   - HTTP 200 with success:false body   -> RATE_LIMIT_ERROR backs off,
+//                                           anything else is a hard error
+// On success returns true and `out` holds the parsed JSON body.
+static bool apiRequest(const wchar_t* method, const std::wstring& path,
+                       const std::string& body, json& out)
 {
-    std::string body = std::string("{")
-        + "\"grant_type\":\"client_credentials\","
-        + "\"client_id\":\"" + CLIENT_ID + "\","
-        + "\"client_secret\":\"" + CLIENT_SECRET + "\""
-        + "}";
-
-    Response resp;
-    if (!sendRequest(WOVE_HOST, TOKEN_PATH, L"POST", body, L"application/json", L"", resp)) {
-        log("Token request failed"); return "";
-    }
-    if (resp.statusCode != 200) { log("Token error: " + resp.body); return ""; }
-
-    auto j = json::parse(resp.body, nullptr, false);
-    if (j.is_discarded() || !j.contains("access_token")) {
-        log("Could not parse access_token"); return "";
-    }
-    return j["access_token"].get<std::string>();
-}
-
-// ---------------------------------------------------------------------------
-// Wove GET — fetches all orgs with pagination, keyed by code
-// ---------------------------------------------------------------------------
-static bool fetchWoveOrgs(const std::wstring& auth, std::map<std::string, OrgRecord>& out)
-{
-    const int PAGE = 100;
-    int skip = 0;
-    int total = -1;
-
-    do {
-        std::wstring path = std::wstring(ORG_PATH)
-            + L"?skip=" + std::to_wstring(skip)
-            + L"&limit=" + std::to_wstring(PAGE);
-
-        Response resp;
-        if (!sendRequest(WOVE_HOST, path.c_str(), L"GET", "", L"", auth, resp)) {
-            log("GET orgs failed at skip=" + std::to_string(skip)); return false;
+    for (int attempt = 1; attempt <= HTTP_MAX_ATTEMPTS; ++attempt) {
+        if (attempt > 1) {
+            int delayMs = HTTP_BACKOFF_BASE_MS << (attempt - 2);   // 2s..32s
+            log("  retry " + std::to_string(attempt) + "/" + std::to_string(HTTP_MAX_ATTEMPTS)
+                + " in " + std::to_string(delayMs / 1000) + "s");
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
         }
-        if (resp.statusCode != 200) {
-            log("GET orgs HTTP " + std::to_string(resp.statusCode) + ": " + resp.body);
+
+        pace();
+        g_requestCount++;
+        Response resp;
+        if (!sendOnce(method, path, body, g_token, resp)) {
+            log("  network failure"); continue;
+        }
+        if (resp.statusCode == 401) {
+            log("  HTTP 401 — refreshing token");
+            if (!authenticate()) continue;
+            pace();
+            g_requestCount++;
+            resp = Response{};
+            if (!sendOnce(method, path, body, g_token, resp)) { log("  network failure"); continue; }
+        }
+        if (resp.statusCode == 429 || resp.statusCode >= 500) {
+            log("  HTTP " + std::to_string(resp.statusCode)); continue;
+        }
+
+        json j = json::parse(resp.body, nullptr, false);
+        if (j.is_discarded()) {
+            log("  unparseable response body (HTTP " + std::to_string(resp.statusCode) + ")");
+            continue;
+        }
+        // Rate-limit errors arrive as HTTP 200 with success:false — check body
+        if (j.contains("success") && j["success"].is_boolean() && !j["success"].get<bool>()) {
+            std::string code = j.value("error", json::object()).value("code", "");
+            if (code == "RATE_LIMIT_ERROR") { log("  RATE_LIMIT_ERROR (body)"); continue; }
+            log("  API error: " + j.dump());
             return false;
         }
+        if (resp.statusCode < 200 || resp.statusCode >= 300) {
+            log("  HTTP " + std::to_string(resp.statusCode) + ": " + resp.body);
+            return false;
+        }
+        out = std::move(j);
+        return true;
+    }
+    log("  giving up after " + std::to_string(HTTP_MAX_ATTEMPTS) + " attempts");
+    return false;
+}
 
-        auto j = json::parse(resp.body, nullptr, false);
-        if (j.is_discarded()) { log("Failed to parse GET response"); return false; }
+// ---------------------------------------------------------------------------
+// Wove GET — all orgs via page/limit pagination, keyed by code
+// ---------------------------------------------------------------------------
+static bool fetchWoveOrgs(std::map<std::string, OrgRecord>& out)
+{
+    int totalPages = -1, total = -1, dupCodes = 0;
 
-        if (total < 0 && j.contains("pagination"))
-            total = j["pagination"].value("total", 0);
+    for (int page = 1; totalPages < 0 || page <= totalPages; ++page) {
+        std::wstring path = std::wstring(ORG_PATH)
+            + L"?page=" + std::to_wstring(page)
+            + L"&limit=" + std::to_wstring(PAGE_SIZE);
 
+        json j;
+        if (!apiRequest(L"GET", path, "", j)) {
+            log("GET orgs failed at page " + std::to_string(page)); return false;
+        }
+
+        // A partial org list mistaken for the full list would cause duplicate
+        // creates — missing pagination metadata is fatal, not recoverable.
+        if (!j.contains("pagination") || !j["pagination"].contains("total")) {
+            log("FATAL: response missing pagination.total at page " + std::to_string(page));
+            return false;
+        }
+        // The API silently ignores unknown pagination params (`skip` bug) —
+        // the echoed page number is the only proof we got the page we asked for.
+        int echoedPage = j["pagination"].value("page", -1);
+        if (echoedPage != page) {
+            log("FATAL: requested page " + std::to_string(page)
+                + " but response says page " + std::to_string(echoedPage)
+                + " — pagination contract broken");
+            return false;
+        }
+        if (totalPages < 0) {
+            total      = j["pagination"].value("total", 0);
+            totalPages = j["pagination"].value("totalPages", 0);
+            log("Wove reports " + std::to_string(total) + " orgs over "
+                + std::to_string(totalPages) + " pages");
+            if (total <= 0 || totalPages <= 0) { log("FATAL: implausible pagination totals"); return false; }
+        }
+
+        if (!j.contains("data") || !j["data"].is_array()) {
+            log("FATAL: no data array at page " + std::to_string(page)); return false;
+        }
         for (auto& item : j["data"]) {
             OrgRecord r;
-            r.woweId      = item.value("id", "");
-            r.code        = item.value("code", "");
-            r.name        = item.value("name", "");
-            r.carrierCode = item.value("carrierCode", "");
-            r.address1    = item.value("address1", "");
-            r.address2    = item.value("address2", "");
-            r.city        = item.value("city", "");
-            r.state       = item.value("state", "");
-            r.postalCode  = item.value("postalCode", "");
-            r.country     = item.value("country", "");
-            r.phoneNumber = item.value("phoneNumber", "");
-            r.mobileNumber= item.value("mobileNumber", "");
-            r.faxNumber   = item.value("faxNumber", "");
-            r.email       = item.value("email", "");
-            r.website     = item.value("website", "");
-            r.isActive    = item.value("isActive", true);
-
-            // Flatten types array back to comma-delimited for comparison
+            r.woveId     = item.value("id", "");
+            r.code       = sanitize(item.value("code", ""));
+            r.name       = sanitize(item.value("name", ""));
+            r.address1   = sanitize(item.value("address1", ""));
+            r.address2   = sanitize(item.value("address2", ""));
+            r.city       = sanitize(item.value("city", ""));
+            r.state      = sanitize(item.value("state", ""));
+            r.postalCode = sanitize(item.value("postalCode", ""));
+            r.country    = sanitize(item.value("country", ""));
+            r.phone      = sanitize(item.value("phoneNumber", ""));
+            r.mobile     = sanitize(item.value("mobileNumber", ""));
+            r.fax        = sanitize(item.value("faxNumber", ""));
+            r.email      = sanitize(item.value("email", ""));
+            r.isActive   = item.value("isActive", true);
             if (item.contains("types") && item["types"].is_array()) {
-                std::string t;
-                for (auto& v : item["types"]) {
-                    if (!t.empty()) t += ",";
-                    t += v.get<std::string>();
-                }
-                r.types = t;
+                std::vector<std::string> t;
+                for (auto& v : item["types"])
+                    if (v.is_string()) t.push_back(v.get<std::string>());
+                r.types = normalizeTypes(std::move(t));
             }
-
-            if (!r.code.empty()) out[r.code] = r;
+            if (r.code.empty()) continue;
+            if (out.count(r.code)) dupCodes++;
+            out[r.code] = r;
         }
 
-        skip += PAGE;
-    } while (skip < total);
+        if (page % 100 == 0)
+            log("  fetched page " + std::to_string(page) + "/" + std::to_string(totalPages)
+                + " (" + std::to_string(out.size()) + " orgs)");
+    }
 
-    log("Fetched " + std::to_string(out.size()) + " orgs from Wove.");
+    // Unstable page ordering means a sweep can miss/duplicate a few records.
+    long missed = total - (long)out.size();
+    log("Fetched " + std::to_string(out.size()) + " unique orgs from Wove (total="
+        + std::to_string(total) + ", dup codes across pages=" + std::to_string(dupCodes)
+        + ", missed=" + std::to_string(missed) + ")");
+    if (missed > RECONCILE_TOLERANCE) {
+        log("FATAL: missed " + std::to_string(missed) + " orgs (> tolerance "
+            + std::to_string(RECONCILE_TOLERANCE) + ") — unstable pagination sweep");
+        return false;
+    }
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// Fabric ODBC query — returns orgs keyed by code
+// CW1 ODBC
 // ---------------------------------------------------------------------------
-static bool fetchFabricOrgs(std::map<std::string, OrgRecord>& out)
+static void logOdbcDiagnostics(SQLSMALLINT handleType, SQLHANDLE handle, const char* where)
 {
-    SQLHENV  hEnv  = SQL_NULL_HANDLE;
-    SQLHDBC  hDbc  = SQL_NULL_HANDLE;
+    SQLSMALLINT i = 1;
+    SQLCHAR state[6], text[1024];
+    SQLINTEGER native;
+    SQLSMALLINT len;
+    while (SQLGetDiagRec(handleType, handle, i, state, &native, text, sizeof(text), &len)
+           == SQL_SUCCESS) {
+        log(std::string("ODBC ") + where + " [" + (char*)state + "] ("
+            + std::to_string(native) + ") " + (char*)text);
+        i++;
+    }
+}
+
+// Reads one column fully via get-data-in-parts — no fixed-buffer truncation.
+static bool getColString(SQLHSTMT hStmt, SQLUSMALLINT col, std::string& dest)
+{
+    dest.clear();
+    char buf[4096];
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLGetData(hStmt, col, SQL_C_CHAR, buf, sizeof(buf), &ind);
+    while (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+        if (ind == SQL_NULL_DATA) return true;
+        // chunk is NUL-terminated; length is min(ind, buf-1) or full buffer on SQL_NO_TOTAL
+        size_t got = (ind == SQL_NO_TOTAL || (size_t)ind >= sizeof(buf))
+                       ? sizeof(buf) - 1 : (size_t)ind;
+        dest.append(buf, got);
+        if (rc == SQL_SUCCESS) return true;          // whole value consumed
+        rc = SQLGetData(hStmt, col, SQL_C_CHAR, buf, sizeof(buf), &ind);
+    }
+    return rc == SQL_NO_DATA ? true : false;
+}
+
+static bool fetchCw1Orgs(std::map<std::string, OrgRecord>& out)
+{
+    std::string server   = getEnvOrEmpty("CW1_SERVER");
+    std::string database = getEnvOrEmpty("CW1_DATABASE");
+    std::string user     = getEnvOrEmpty("CW1_DB_USER");
+    std::string password = getEnvOrEmpty("CW1_DB_PASSWORD");
+
+    std::string connStr =
+        "Driver={ODBC Driver 18 for SQL Server};"
+        "Server=tcp:" + server + ";"
+        "Database=" + database + ";"
+        "UID=" + user + ";"
+        "PWD=" + password + ";"
+        "Encrypt=yes;TrustServerCertificate=yes;"
+        "Connection Timeout=30;";
+
+    SQLHENV hEnv = SQL_NULL_HANDLE;
+    SQLHDBC hDbc = SQL_NULL_HANDLE;
     SQLHSTMT hStmt = SQL_NULL_HANDLE;
+    bool ok = false;
+    long emptyCodes = 0, dupCodes = 0;
 
-    if (SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &hEnv) != SQL_SUCCESS) {
-        log("ODBC: SQLAllocHandle ENV failed"); return false;
-    }
-    SQLSetEnvAttr(hEnv, SQL_ATTR_ODBC_VERSION, (SQLPOINTER)SQL_OV_ODBC3, 0);
+    do {
+        if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &hEnv))) {
+            log("ODBC: env alloc failed"); break;
+        }
+        SQLSetEnvAttr(hEnv, SQL_ATTR_ODBC_VERSION, (SQLPOINTER)SQL_OV_ODBC3, 0);
+        if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, hEnv, &hDbc))) {
+            log("ODBC: dbc alloc failed"); break;
+        }
 
-    if (SQLAllocHandle(SQL_HANDLE_DBC, hEnv, &hDbc) != SQL_SUCCESS) {
-        log("ODBC: SQLAllocHandle DBC failed");
-        SQLFreeHandle(SQL_HANDLE_ENV, hEnv); return false;
-    }
+        SQLCHAR outStr[1024]; SQLSMALLINT outLen;
+        SQLRETURN rc = SQLDriverConnect(hDbc, nullptr,
+            (SQLCHAR*)connStr.c_str(), SQL_NTS,
+            outStr, sizeof(outStr), &outLen, SQL_DRIVER_NOPROMPT);
+        if (!SQL_SUCCEEDED(rc)) {
+            log("ODBC: connection to " + server + " failed");
+            logOdbcDiagnostics(SQL_HANDLE_DBC, hDbc, "connect");
+            break;
+        }
+        log("ODBC: connected to " + server + "/" + database);
 
-    SQLCHAR outConnStr[1024]; SQLSMALLINT outLen;
-    SQLRETURN rc = SQLDriverConnect(hDbc, nullptr,
-        (SQLCHAR*)ODBC_CONN_STRING, SQL_NTS,
-        outConnStr, sizeof(outConnStr), &outLen, SQL_DRIVER_NOPROMPT);
+        if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmt))) {
+            log("ODBC: stmt alloc failed"); break;
+        }
+        rc = SQLExecDirect(hStmt, (SQLCHAR*)CW1_QUERY, SQL_NTS);
+        if (!SQL_SUCCEEDED(rc)) {
+            log("ODBC: query failed");
+            logOdbcDiagnostics(SQL_HANDLE_STMT, hStmt, "query");
+            break;
+        }
 
-    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
-        log("ODBC: connection failed");
-        SQLFreeHandle(SQL_HANDLE_DBC, hDbc);
-        SQLFreeHandle(SQL_HANDLE_ENV, hEnv);
+        // SQL_SUCCEEDED tolerates SQL_SUCCESS_WITH_INFO — the TVF emits a
+        // null-aggregate warning that must not end the loop early.
+        while (true) {
+            rc = SQLFetch(hStmt);
+            if (rc == SQL_NO_DATA) { ok = true; break; }
+            if (!SQL_SUCCEEDED(rc)) {
+                log("ODBC: fetch failed at row " + std::to_string(out.size() + 1));
+                logOdbcDiagnostics(SQL_HANDLE_STMT, hStmt, "fetch");
+                break;
+            }
+
+            OrgRecord r;
+            std::string typesCsv;
+            bool colOk = getColString(hStmt, 1,  r.orgPk)
+                      && getColString(hStmt, 2,  r.code)
+                      && getColString(hStmt, 3,  r.name)
+                      && getColString(hStmt, 4,  typesCsv)
+                      && getColString(hStmt, 5,  r.address1)
+                      && getColString(hStmt, 6,  r.address2)
+                      && getColString(hStmt, 7,  r.city)
+                      && getColString(hStmt, 8,  r.state)
+                      && getColString(hStmt, 9,  r.postalCode)
+                      && getColString(hStmt, 10, r.country)
+                      && getColString(hStmt, 11, r.phone)
+                      && getColString(hStmt, 12, r.mobile)
+                      && getColString(hStmt, 13, r.fax)
+                      && getColString(hStmt, 14, r.email);
+            if (!colOk) {
+                log("ODBC: column read failed at row " + std::to_string(out.size() + 1));
+                logOdbcDiagnostics(SQL_HANDLE_STMT, hStmt, "getdata");
+                break;
+            }
+
+            r.code       = sanitize(r.code);
+            r.name       = sanitize(r.name);
+            r.address1   = sanitize(r.address1);
+            r.address2   = sanitize(r.address2);
+            r.city       = sanitize(r.city);
+            r.state      = sanitize(r.state);
+            r.postalCode = sanitize(r.postalCode);
+            r.country    = sanitize(r.country);
+            r.phone      = sanitize(r.phone);
+            r.mobile     = sanitize(r.mobile);
+            r.fax        = sanitize(r.fax);
+            r.email      = sanitize(r.email);
+            r.types      = mapCw1Types(typesCsv);
+            r.isActive   = true;   // query filters OH_IsActive = 1
+
+            if (r.code.empty()) { emptyCodes++; continue; }
+            if (out.count(r.code)) { dupCodes++; continue; }
+            out[r.code] = r;
+        }
+    } while (false);
+
+    if (hStmt) SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+    if (hDbc)  { SQLDisconnect(hDbc); SQLFreeHandle(SQL_HANDLE_DBC, hDbc); }
+    if (hEnv)  SQLFreeHandle(SQL_HANDLE_ENV, hEnv);
+    if (!ok) return false;
+
+    // SQL contract: one row per org, non-null unique codes, plausible volume.
+    log("Fetched " + std::to_string(out.size()) + " orgs from CW1.");
+    if (emptyCodes > 0) { log("FATAL: contract violation — " + std::to_string(emptyCodes) + " rows with empty code"); return false; }
+    if (dupCodes   > 0) { log("FATAL: contract violation — " + std::to_string(dupCodes) + " duplicate codes"); return false; }
+    if ((long)out.size() < CW1_MIN_EXPECTED_ROWS) {
+        log("FATAL: contract violation — row count " + std::to_string(out.size())
+            + " below expected floor " + std::to_string(CW1_MIN_EXPECTED_ROWS));
         return false;
     }
-    log("ODBC: connected to Fabric.");
-
-    if (SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmt) != SQL_SUCCESS) {
-        log("ODBC: SQLAllocHandle STMT failed");
-        SQLDisconnect(hDbc); SQLFreeHandle(SQL_HANDLE_DBC, hDbc);
-        SQLFreeHandle(SQL_HANDLE_ENV, hEnv); return false;
+    if (!g_unknownCw1Types.empty()) {
+        std::string s;
+        for (const auto& t : g_unknownCw1Types) s += (s.empty() ? "" : ",") + t;
+        log("WARNING: unmapped CW1 type tokens ignored: " + s);
     }
-
-    rc = SQLExecDirect(hStmt, (SQLCHAR*)FABRIC_QUERY, SQL_NTS);
-    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
-        log("ODBC: query failed");
-        SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
-        SQLDisconnect(hDbc); SQLFreeHandle(SQL_HANDLE_DBC, hDbc);
-        SQLFreeHandle(SQL_HANDLE_ENV, hEnv); return false;
-    }
-
-    // Column bind helper — reads nullable varchar into std::string
-    auto getCol = [&](SQLUSMALLINT col, std::string& dest) {
-        char buf[512] = {};
-        SQLLEN ind = 0;
-        SQLGetData(hStmt, col, SQL_C_CHAR, buf, sizeof(buf), &ind);
-        dest = (ind == SQL_NULL_DATA) ? "" : std::string(buf);
-    };
-
-    while (SQLFetch(hStmt) == SQL_SUCCESS) {
-        OrgRecord r;
-        SQLLEN isActiveInd = 0;
-        SQLSMALLINT isActiveBit = 1;
-
-        getCol(1,  r.code);
-        getCol(2,  r.name);
-        getCol(3,  r.types);
-        getCol(4,  r.carrierCode);
-        getCol(5,  r.address1);
-        getCol(6,  r.address2);
-        getCol(7,  r.city);
-        getCol(8,  r.state);
-        getCol(9,  r.postalCode);
-        getCol(10, r.country);
-        getCol(11, r.phoneNumber);
-        getCol(12, r.mobileNumber);
-        getCol(13, r.faxNumber);
-        getCol(14, r.email);
-        getCol(15, r.website);
-        SQLGetData(hStmt, 16, SQL_C_SSHORT, &isActiveBit, sizeof(isActiveBit), &isActiveInd);
-        r.isActive = (isActiveInd != SQL_NULL_DATA) ? (isActiveBit != 0) : true;
-
-        if (!r.code.empty()) out[r.code] = r;
-    }
-
-    SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
-    SQLDisconnect(hDbc);
-    SQLFreeHandle(SQL_HANDLE_DBC, hDbc);
-    SQLFreeHandle(SQL_HANDLE_ENV, hEnv);
-
-    log("Fetched " + std::to_string(out.size()) + " orgs from Fabric.");
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// Wove POST / PUT
+// Wove writes
 // ---------------------------------------------------------------------------
-static bool postOrg(const std::wstring& auth, const OrgRecord& org)
+static bool postOrg(const OrgRecord& org)
 {
-    std::string payload = buildPayload(org);
-    Response resp;
-    if (!sendRequest(WOVE_HOST, ORG_PATH, L"POST", payload, L"application/json", auth, resp))
+    json out;
+    if (!apiRequest(L"POST", ORG_PATH, buildPayload(org).dump(), out)) {
+        log("  CREATE FAILED " + org.code);
         return false;
-    bool ok = (resp.statusCode == 200 || resp.statusCode == 201);
-    log((ok ? "  CREATED " : "  CREATE FAILED ") + org.code + " HTTP " + std::to_string(resp.statusCode));
-    return ok;
+    }
+    log("  CREATED " + org.code);
+    return true;
 }
 
-static bool putOrg(const std::wstring& auth, const OrgRecord& org)
+static bool putOrg(const OrgRecord& org)
 {
-    std::wstring path = std::wstring(ORG_PATH) + L"/"
-        + std::wstring(org.woweId.begin(), org.woweId.end());
-    std::string payload = buildPayload(org);
-    Response resp;
-    if (!sendRequest(WOVE_HOST, path.c_str(), L"PUT", payload, L"application/json", auth, resp))
+    std::wstring path = std::wstring(ORG_PATH) + L"/" + toWide(org.woveId);
+    json out;
+    if (!apiRequest(L"PUT", path, buildPayload(org).dump(), out)) {
+        log("  UPDATE FAILED " + org.code);
         return false;
-    bool ok = (resp.statusCode == 200 || resp.statusCode == 201);
-    log((ok ? "  UPDATED " : "  UPDATE FAILED ") + org.code + " HTTP " + std::to_string(resp.statusCode));
-    return ok;
+    }
+    log("  UPDATED " + org.code);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
-int main()
+static std::string joinFields(const std::vector<std::string>& v)
 {
-    log("=== wove_org_sync start ===");
+    std::string s;
+    for (const auto& f : v) s += (s.empty() ? "" : ",") + f;
+    return s;
+}
+
+int main(int argc, char* argv[])
+{
+    bool dryRun = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--dry-run") dryRun = true;
+        else { std::cerr << "Unknown argument: " << argv[i] << "\n"; return 1; }
+    }
+
+    log(std::string("=== wove_org_sync start") + (dryRun ? " (DRY RUN)" : "") + " ===");
+
+    // Credentials from environment — never compiled in
+    g_clientId     = getEnvOrEmpty("WOVE_CLIENT_ID");
+    g_clientSecret = getEnvOrEmpty("WOVE_CLIENT_SECRET");
+    const char* required[] = { "WOVE_CLIENT_ID", "WOVE_CLIENT_SECRET",
+                               "CW1_SERVER", "CW1_DATABASE", "CW1_DB_USER", "CW1_DB_PASSWORD" };
+    for (const char* name : required) {
+        if (getEnvOrEmpty(name).empty()) {
+            log(std::string("FATAL: missing required environment variable ") + name);
+            return 1;
+        }
+    }
+
+    long maxWrites = DEFAULT_MAX_WRITES;
+    std::string mw = getEnvOrEmpty("WOVE_MAX_WRITES_PER_RUN");
+    if (!mw.empty()) {
+        try { maxWrites = std::stol(mw); }
+        catch (...) { log("FATAL: WOVE_MAX_WRITES_PER_RUN is not a number: " + mw); return 1; }
+        if (maxWrites < 0) { log("FATAL: WOVE_MAX_WRITES_PER_RUN must be >= 0"); return 1; }
+    }
 
     // 1. Auth
-    std::string token = getAccessToken();
-    if (token.empty()) { log("Aborting: no access token."); return 1; }
-    std::wstring auth = L"Bearer " + std::wstring(token.begin(), token.end());
+    if (!authenticate()) { log("Aborting: authentication failed."); return 1; }
+    log("Authenticated with Wove.");
 
-    // 2. Fetch from both sources
-    std::map<std::string, OrgRecord> woveOrgs;
-    std::map<std::string, OrgRecord> fabricOrgs;
+    // 2. Fetch both sides
+    std::map<std::string, OrgRecord> woveOrgs, cw1Orgs;
+    if (!fetchWoveOrgs(woveOrgs)) { log("Aborting: Wove fetch failed."); return 1; }
+    if (!fetchCw1Orgs(cw1Orgs))   { log("Aborting: CW1 fetch failed.");  return 1; }
 
-    if (!fetchWoveOrgs(auth, woveOrgs))   { log("Aborting: Wove fetch failed.");   return 1; }
-    if (!fetchFabricOrgs(fabricOrgs))     { log("Aborting: Fabric fetch failed."); return 1; }
+    // 3. Diff
+    std::vector<const OrgRecord*> toCreate;
+    std::vector<std::pair<OrgRecord, std::vector<std::string>>> toUpdate;
+    long unchanged = 0;
 
-    // 3. Diff and sync
-    int created = 0, updated = 0, skipped = 0;
-
-    for (auto& [code, fabricOrg] : fabricOrgs) {
+    for (auto& [code, src] : cw1Orgs) {
         auto it = woveOrgs.find(code);
         if (it == woveOrgs.end()) {
-            // New — POST
-            if (postOrg(auth, fabricOrg)) created++;
+            toCreate.push_back(&src);
         } else {
-            // Existing — PUT only if something changed
-            OrgRecord merged = fabricOrg;
-            merged.woweId = it->second.woweId;
-            if (!orgsEqual(fabricOrg, it->second)) {
-                if (putOrg(auth, merged)) updated++;
-            } else {
-                skipped++;
-            }
+            auto diffs = changedFields(src, it->second);
+            if (diffs.empty()) { unchanged++; continue; }
+            OrgRecord merged = src;
+            merged.woveId = it->second.woveId;
+            toUpdate.emplace_back(std::move(merged), std::move(diffs));
         }
     }
 
-    // Log any orgs in Wove that are no longer in Fabric (not auto-deleted)
-    for (auto& [code, woveOrg] : woveOrgs) {
-        if (fabricOrgs.find(code) == fabricOrgs.end())
-            log("  ORPHAN in Wove (not in Fabric, not deleted): " + code);
+    long orphans = 0;
+    for (auto& [code, w] : woveOrgs) {
+        if (!cw1Orgs.count(code)) {
+            orphans++;
+            log("  ORPHAN in Wove (not in CW1 source, not deleted): " + code);
+        }
     }
+
+    log("Diff: creates=" + std::to_string(toCreate.size())
+        + " updates=" + std::to_string(toUpdate.size())
+        + " unchanged=" + std::to_string(unchanged)
+        + " orphans=" + std::to_string(orphans));
+
+    // 4. Apply (or enumerate, in dry-run)
+    long created = 0, updated = 0, failed = 0, deferred = 0, writes = 0;
+
+    for (const OrgRecord* org : toCreate) {
+        if (dryRun) { log("  DRY-RUN CREATE " + org->code + " (new)"); continue; }
+        if (writes >= maxWrites) { deferred++; continue; }
+        writes++;
+        postOrg(*org) ? created++ : failed++;
+    }
+    for (auto& [org, diffs] : toUpdate) {
+        if (dryRun) { log("  DRY-RUN UPDATE " + org.code + " fields: " + joinFields(diffs)); continue; }
+        if (writes >= maxWrites) { deferred++; continue; }
+        writes++;
+        putOrg(org) ? updated++ : failed++;
+    }
+
+    if (deferred > 0)
+        log("Write budget (" + std::to_string(maxWrites) + ") exhausted — "
+            + std::to_string(deferred) + " writes deferred to next run.");
 
     log("Sync complete — created: " + std::to_string(created)
         + "  updated: " + std::to_string(updated)
-        + "  unchanged: " + std::to_string(skipped));
-    log("=== wove_org_sync end ===\n");
+        + "  unchanged: " + std::to_string(unchanged)
+        + "  orphans: " + std::to_string(orphans)
+        + "  failed: " + std::to_string(failed)
+        + "  deferred: " + std::to_string(deferred)
+        + "  api requests: " + std::to_string(g_requestCount));
+    log(std::string("=== wove_org_sync end") + (dryRun ? " (DRY RUN)" : "") + " ===");
 
-    return 0;
+    return failed > 0 ? 1 : 0;
 }

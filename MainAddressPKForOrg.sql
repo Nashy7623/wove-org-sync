@@ -1,0 +1,26 @@
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+CREATE FUNCTION [dbo].[MainAddressPkForOrg] (@OrgHeaderPk UNIQUEIDENTIFIER)
+RETURNS TABLE
+WITH SCHEMABINDING
+AS RETURN
+WITH
+	data AS (
+		SELECT
+			PK_OFC = MAX(CASE WHEN OFCIsMainAddress = 'Y' THEN OA_PK END),
+			PK_PST = MAX(CASE WHEN PSTIsMainAddress = 'Y' THEN OA_PK END),
+			PK_PAD = MAX(CASE WHEN PADIsMainAddress = 'Y' THEN OA_PK END),
+			PK_PIC = MAX(CASE WHEN PICIsMainAddress = 'Y' THEN OA_PK END),
+			PK_DLV = MAX(CASE WHEN DLVIsMainAddress = 'Y' THEN OA_PK END),
+			PK_Any = MAX(OA_PK)
+		FROM
+			dbo.OrgAddress
+			LEFT JOIN dbo.vw_OrgAddressIsTypeOf ON vw_OrgAddressIsTypeOf.PZ_OA = OrgAddress.OA_PK
+		WHERE
+			OA_OH = @OrgHeaderPk
+	)
+SELECT PK = COALESCE(PK_OFC, PK_PST, PK_PAD, PK_PIC, PK_DLV, PK_Any)
+FROM data
+GO
