@@ -1,18 +1,22 @@
 // wove_org_sync.cpp
 // Syncs AU-region TMS Organizations from the CW1 reporting SQL Server (direct
 // ODBC query) to the Wove External API. Fetches all current Wove orgs
-// (page/limit pagination), fetches active CW1 orgs (main address resolved by
-// dbo.MainAddressPkForOrg), diffs in memory keyed on org code, POSTs new orgs
-// and PUTs changed ones. Orphans (in Wove, not in CW1) are logged, never
-// deleted.
+// (page/limit pagination), fetches all CW1 orgs incl. inactive (main address
+// resolved by dbo.MainAddressPkForOrg), diffs in memory keyed on org code,
+// POSTs new orgs and PUTs changed ones. Orgs inactive in CW1 are soft-deleted
+// in Wove (isActive=false via PUT); inactive orgs absent from Wove are never
+// created. Orphans (in Wove, not in CW1) are logged as warnings, never deleted.
 //
 // PRD: https://github.com/Nashy7623/wove-org-sync/issues/1
 //
 // Usage:
-//   wove_org_sync.exe [--dry-run]
+//   wove_org_sync.exe [--dry-run] [--sql-only]
 //
 //   --dry-run   Full pipeline (auth, both fetches, diff) but no writes;
 //               logs every intended create/update with the changed fields.
+//   --sql-only  Local test mode: skips Wove auth and the (~28 min) GET sweep,
+//               runs ONLY the CW1 ODBC fetch through the real code path,
+//               logs counts + a sample, then exits. Needs only CW1_* env vars.
 //
 // Environment (all required):
 //   WOVE_CLIENT_ID, WOVE_CLIENT_SECRET
@@ -119,11 +123,11 @@ static const char* CW1_QUERY =
     "    ISNULL(oa.OA_Phone,'')                AS phone,"
     "    ISNULL(oa.OA_Mobile,'')               AS mobile,"
     "    ISNULL(oa.OA_Fax,'')                  AS fax,"
-    "    ISNULL(oa.OA_Email,'')                AS email "
+    "    ISNULL(oa.OA_Email,'')                AS email,"
+    "    CONVERT(char(1), oh.OH_IsActive)      AS is_active "
     "FROM dbo.OrgHeader oh "
     "OUTER APPLY dbo.MainAddressPkForOrg(oh.OH_PK) m "
-    "LEFT JOIN dbo.OrgAddress oa ON oa.OA_PK = m.PK "
-    "WHERE oh.OH_IsActive = 1";
+    "LEFT JOIN dbo.OrgAddress oa ON oa.OA_PK = m.PK";
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -170,6 +174,25 @@ static std::string sanitize(const std::string& s)
     if (b == std::string::npos) return "";
     size_t e = out.find_last_not_of(' ');
     return out.substr(b, e - b + 1);
+}
+
+// Wove JSON fields are frequently null rather than absent. nlohmann's
+// value(key, default) THROWS json::type_error on a present-but-null (or
+// wrong-typed) value — an uncaught throw that aborts the whole sweep
+// (0xC0000409) a few records into page 1. These read defensively instead:
+// null / missing / wrong-type all collapse to the default.
+static std::string jstr(const json& o, const char* key)
+{
+    auto it = o.find(key);
+    if (it == o.end() || !it->is_string()) return "";
+    return it->get<std::string>();
+}
+
+static bool jbool(const json& o, const char* key, bool def)
+{
+    auto it = o.find(key);
+    if (it == o.end() || !it->is_boolean()) return def;
+    return it->get<bool>();
 }
 
 static std::vector<std::string> splitCsv(const std::string& csv)
@@ -466,7 +489,9 @@ static bool fetchWoveOrgs(std::map<std::string, OrgRecord>& out)
             total      = j["pagination"].value("total", 0);
             totalPages = j["pagination"].value("totalPages", 0);
             log("Wove reports " + std::to_string(total) + " orgs over "
-                + std::to_string(totalPages) + " pages");
+                + std::to_string(totalPages) + " pages (~"
+                + std::to_string((long)totalPages * PACE_INTERVAL_MS / 60000)
+                + " min to sweep at " + std::to_string(PACE_INTERVAL_MS) + "ms/page)");
             if (total <= 0 || totalPages <= 0) { log("FATAL: implausible pagination totals"); return false; }
         }
 
@@ -475,20 +500,20 @@ static bool fetchWoveOrgs(std::map<std::string, OrgRecord>& out)
         }
         for (auto& item : j["data"]) {
             OrgRecord r;
-            r.woveId     = item.value("id", "");
-            r.code       = sanitize(item.value("code", ""));
-            r.name       = sanitize(item.value("name", ""));
-            r.address1   = sanitize(item.value("address1", ""));
-            r.address2   = sanitize(item.value("address2", ""));
-            r.city       = sanitize(item.value("city", ""));
-            r.state      = sanitize(item.value("state", ""));
-            r.postalCode = sanitize(item.value("postalCode", ""));
-            r.country    = sanitize(item.value("country", ""));
-            r.phone      = sanitize(item.value("phoneNumber", ""));
-            r.mobile     = sanitize(item.value("mobileNumber", ""));
-            r.fax        = sanitize(item.value("faxNumber", ""));
-            r.email      = sanitize(item.value("email", ""));
-            r.isActive   = item.value("isActive", true);
+            r.woveId     = jstr(item, "id");
+            r.code       = sanitize(jstr(item, "code"));
+            r.name       = sanitize(jstr(item, "name"));
+            r.address1   = sanitize(jstr(item, "address1"));
+            r.address2   = sanitize(jstr(item, "address2"));
+            r.city       = sanitize(jstr(item, "city"));
+            r.state      = sanitize(jstr(item, "state"));
+            r.postalCode = sanitize(jstr(item, "postalCode"));
+            r.country    = sanitize(jstr(item, "country"));
+            r.phone      = sanitize(jstr(item, "phoneNumber"));
+            r.mobile     = sanitize(jstr(item, "mobileNumber"));
+            r.fax        = sanitize(jstr(item, "faxNumber"));
+            r.email      = sanitize(jstr(item, "email"));
+            r.isActive   = jbool(item, "isActive", true);
             if (item.contains("types") && item["types"].is_array()) {
                 std::vector<std::string> t;
                 for (auto& v : item["types"])
@@ -500,7 +525,7 @@ static bool fetchWoveOrgs(std::map<std::string, OrgRecord>& out)
             out[r.code] = r;
         }
 
-        if (page % 100 == 0)
+        if (page % 25 == 0 || page == totalPages)
             log("  fetched page " + std::to_string(page) + "/" + std::to_string(totalPages)
                 + " (" + std::to_string(out.size()) + " orgs)");
     }
@@ -618,7 +643,7 @@ static bool fetchCw1Orgs(std::map<std::string, OrgRecord>& out)
             }
 
             OrgRecord r;
-            std::string typesCsv;
+            std::string typesCsv, isActiveStr;
             bool colOk = getColString(hStmt, 1,  r.orgPk)
                       && getColString(hStmt, 2,  r.code)
                       && getColString(hStmt, 3,  r.name)
@@ -632,7 +657,8 @@ static bool fetchCw1Orgs(std::map<std::string, OrgRecord>& out)
                       && getColString(hStmt, 11, r.phone)
                       && getColString(hStmt, 12, r.mobile)
                       && getColString(hStmt, 13, r.fax)
-                      && getColString(hStmt, 14, r.email);
+                      && getColString(hStmt, 14, r.email)
+                      && getColString(hStmt, 15, isActiveStr);
             if (!colOk) {
                 log("ODBC: column read failed at row " + std::to_string(out.size() + 1));
                 logOdbcDiagnostics(SQL_HANDLE_STMT, hStmt, "getdata");
@@ -652,7 +678,8 @@ static bool fetchCw1Orgs(std::map<std::string, OrgRecord>& out)
             r.fax        = sanitize(r.fax);
             r.email      = sanitize(r.email);
             r.types      = mapCw1Types(typesCsv);
-            r.isActive   = true;   // query filters OH_IsActive = 1
+            // OH_IsActive (bit) read as char: '1' active, '0'/NULL inactive.
+            r.isActive   = (isActiveStr == "1");
 
             if (r.code.empty()) { emptyCodes++; continue; }
             if (out.count(r.code)) { dupCodes++; continue; }
@@ -718,24 +745,48 @@ static std::string joinFields(const std::vector<std::string>& v)
 
 int main(int argc, char* argv[])
 {
-    bool dryRun = false;
+    bool dryRun = false, sqlOnly = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--dry-run") dryRun = true;
+        else if (std::string(argv[i]) == "--sql-only") sqlOnly = true;
         else { std::cerr << "Unknown argument: " << argv[i] << "\n"; return 1; }
     }
 
-    log(std::string("=== wove_org_sync start") + (dryRun ? " (DRY RUN)" : "") + " ===");
+    log(std::string("=== wove_org_sync start")
+        + (sqlOnly ? " (SQL-ONLY TEST)" : (dryRun ? " (DRY RUN)" : "")) + " ===");
 
-    // Credentials from environment — never compiled in
+    // Credentials from environment — never compiled in. --sql-only exercises
+    // only the CW1 path, so it needs only the CW1 vars.
     g_clientId     = getEnvOrEmpty("WOVE_CLIENT_ID");
     g_clientSecret = getEnvOrEmpty("WOVE_CLIENT_SECRET");
-    const char* required[] = { "WOVE_CLIENT_ID", "WOVE_CLIENT_SECRET",
-                               "CW1_SERVER", "CW1_DATABASE", "CW1_DB_USER", "CW1_DB_PASSWORD" };
-    for (const char* name : required) {
-        if (getEnvOrEmpty(name).empty()) {
-            log(std::string("FATAL: missing required environment variable ") + name);
+    const char* requiredAll[] = { "WOVE_CLIENT_ID", "WOVE_CLIENT_SECRET",
+                                  "CW1_SERVER", "CW1_DATABASE", "CW1_DB_USER", "CW1_DB_PASSWORD" };
+    const char* requiredSql[] = { "CW1_SERVER", "CW1_DATABASE", "CW1_DB_USER", "CW1_DB_PASSWORD" };
+    const char** required = sqlOnly ? requiredSql : requiredAll;
+    int requiredN = sqlOnly ? 4 : 6;
+    for (int i = 0; i < requiredN; ++i) {
+        if (getEnvOrEmpty(required[i]).empty()) {
+            log(std::string("FATAL: missing required environment variable ") + required[i]);
             return 1;
         }
+    }
+
+    // --sql-only: run just the CW1 fetch (real code path), report, exit.
+    if (sqlOnly) {
+        std::map<std::string, OrgRecord> cw1Orgs;
+        log("Fetching CW1 orgs (SQL-only test)...");
+        if (!fetchCw1Orgs(cw1Orgs)) { log("Aborting: CW1 fetch failed."); return 1; }
+        long active = 0, sampled = 0;
+        for (auto& [code, o] : cw1Orgs) if (o.isActive) active++;
+        for (auto& [code, o] : cw1Orgs) {
+            if (sampled++ >= 5) break;
+            log("  SAMPLE " + code + " | " + o.name + " | types=" + joinFields(o.types)
+                + " | " + o.city + " " + o.country + " | active=" + (o.isActive ? "1" : "0"));
+        }
+        log("SQL-only test OK: " + std::to_string(cw1Orgs.size()) + " orgs ("
+            + std::to_string(active) + " active).");
+        log("=== wove_org_sync end (SQL-ONLY TEST) ===");
+        return 0;
     }
 
     long maxWrites = DEFAULT_MAX_WRITES;
@@ -758,11 +809,14 @@ int main(int argc, char* argv[])
     // 3. Diff
     std::vector<const OrgRecord*> toCreate;
     std::vector<std::pair<OrgRecord, std::vector<std::string>>> toUpdate;
-    long unchanged = 0;
+    long unchanged = 0, skippedInactive = 0;
 
     for (auto& [code, src] : cw1Orgs) {
         auto it = woveOrgs.find(code);
         if (it == woveOrgs.end()) {
+            // Never create an org just to mark it inactive — only orgs that
+            // already exist in Wove get soft-deactivated via the update path.
+            if (!src.isActive) { skippedInactive++; continue; }
             toCreate.push_back(&src);
         } else {
             auto diffs = changedFields(src, it->second);
@@ -773,18 +827,25 @@ int main(int argc, char* argv[])
         }
     }
 
+    // There should never be a real orphan: every Wove org must map to a CW1
+    // org. An orphan signals drift (manual Wove edit, code mismatch) — surface
+    // it loudly, but take no destructive action.
     long orphans = 0;
     for (auto& [code, w] : woveOrgs) {
         if (!cw1Orgs.count(code)) {
             orphans++;
-            log("  ORPHAN in Wove (not in CW1 source, not deleted): " + code);
+            log("  WARNING: ORPHAN in Wove (no CW1 source, left untouched): " + code);
         }
     }
 
     log("Diff: creates=" + std::to_string(toCreate.size())
         + " updates=" + std::to_string(toUpdate.size())
         + " unchanged=" + std::to_string(unchanged)
+        + " skipped-inactive-noncreate=" + std::to_string(skippedInactive)
         + " orphans=" + std::to_string(orphans));
+    if (orphans > 0)
+        log("WARNING: " + std::to_string(orphans)
+            + " orphan org(s) in Wove with no CW1 source — investigate drift.");
 
     // 4. Apply (or enumerate, in dry-run)
     long created = 0, updated = 0, failed = 0, deferred = 0, writes = 0;
